@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: o2c-graph-backend
+    env: python
+    buildCommand: |
+      pip install -r backend/requirements.txt
+      cd frontend && npm install && npm run build
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false   # Set this in Render dashboard
+    rootDir: .
