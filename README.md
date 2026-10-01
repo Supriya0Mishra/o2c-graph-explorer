@@ -1,144 +1,118 @@
-# SAP O2C Graph Explorer
+# O2C Graph Explorer
 
-An interactive knowledge graph + LLM-powered query interface for SAP Order-to-Cash data.
+A full-stack application for exploring SAP Order-to-Cash (O2C) data as an interactive graph, with a natural-language query interface that translates questions into SQL.
 
-**Live Demo:** [Add Render URL after deploy]  
-**GitHub:** [Your repo URL]
+I built this to make a business process that spans many tables (sales orders, deliveries, billing documents, journal entries) easy to trace end to end, without writing the joins by hand each time.
 
----
+## Features
 
-## What It Does
+- **Data ingestion**: loads partitioned JSONL exports (49 files, 17 entity types, 21K+ records) into SQLite, detecting each file's entity type automatically.
+- **Graph view**: builds a graph of about 760 nodes and 1,300 edges across 9 entity types, rendered as an interactive force-directed graph with expand, filter and search.
+- **Natural-language queries**: questions are translated to SQL, executed against the database, and answered in plain English with the SQL shown.
+- **Guardrails**: off-topic questions are rejected before they reach the model.
 
-- Ingests raw SAP O2C JSONL exports (17 entity types, 21K+ records)
-- Constructs a **knowledge graph** of business relationships
-- Visualises it interactively — click, expand, filter, search
-- Lets users ask **natural language questions** which are translated to SQL, executed, and answered in plain English
-- Strictly **guardrailed** to the dataset domain
+## Tech stack
 
----
+| Layer | Technology |
+| --- | --- |
+| Backend | Python 3.11, FastAPI, Pydantic, httpx |
+| Database | SQLite |
+| LLM | Llama 3.3 70B via the Groq API |
+| Frontend | React 18, Vite, Tailwind CSS, react-force-graph-2d |
+| Deployment | Render |
 
 ## Architecture
 
 ```
-JSONL Files (49 partitioned files, 17 entity types)
-    │
-    ▼  ingest.py (auto-detects entity type via filename + key heuristics)
-SQLite DB (o2c.db)  ←── zero-config, file-based, full SQL analytics
-    │
-    ├──► graph.py    — builds NetworkX-style graph in memory
-    │                  760 nodes, 1,300 edges across 9 entity types
-    │
-    └──► llm.py      — Gemini 1.5 Flash NL→SQL pipeline
-                       schema-aware prompt + guardrails
-    │
-FastAPI backend  (/api/graph  /api/chat  /api/stats  /api/schema)
-    │
-React frontend  (react-force-graph-2d + custom dark UI)
-    ├── Graph Panel  — interactive force-directed graph
-    └── Chat Panel   — conversational query interface
+JSONL files
+    |
+    v  ingest.py   detects entity type from filename and keys
+SQLite (o2c.db)
+    |
+    |--> graph.py  builds the in-memory graph (nodes, edges)
+    |
+    '--> llm.py    natural language -> SQL -> answer
+    |
+FastAPI (main.py)
+    |
+React frontend
+    |-- GraphPanel  interactive graph
+    '-- ChatPanel   query interface
 ```
 
----
+## REST API
 
-## Discovered O2C Join Chain
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/api/graph` | Full graph (nodes and edges) |
+| GET | `/api/graph/node/{node_id}` | Details and neighbours of one node |
+| GET | `/api/schema` | Database schema |
+| GET | `/api/stats` | Record counts per entity |
+| POST | `/api/chat` | Ask a question in natural language |
+| GET | `/api/health` | Health check |
 
-Reverse-engineered from the actual data (non-obvious):
+## Data model: the O2C join chain
+
+The link between documents is not obvious from the column names. Working it out from the data:
 
 ```
 sales_order.salesOrder
-    ↓  (via delivery_item.referenceSdDocument)
+    v  delivery_item.referenceSdDocument
 delivery_item.deliveryDocument
-    ↓  (via billing_document_item.referenceSdDocument)
+    v  billing_document_item.referenceSdDocument
 billing_document.billingDocument
-    ↓  (via journal_entry_item.referenceDocument)
+    v  journal_entry_item.referenceDocument
 journal_entry_item.accountingDocument
 ```
 
-Key insight: `billing_document_item.referenceSdDocument` points to the **delivery document**, NOT the sales order. This was discovered by cross-referencing ID ranges across tables.
+`billing_document_item.referenceSdDocument` points to the delivery document, not the sales order. I found this by cross-referencing ID ranges across tables.
 
----
+## Design decisions
 
-## Database Choice: SQLite
+**SQLite over a graph database.** The dataset is well under a million rows, and most questions are aggregations and joins, which SQL handles well. SQLite needs no server and deploys as a single file. The graph is built in memory on top of it and is used only for visualisation.
 
-Chosen over Neo4j / PostgreSQL because:
+**Two-stage LLM pipeline.**
 
-| Criterion | SQLite | Neo4j |
-|---|---|---|
-| Setup | Zero — file-based | Server required |
-| SQL analytics | Full ANSI SQL | Cypher (limited aggregations) |
-| Dataset size | Perfect for <1M rows | Overkill |
-| Portability | Single `.db` file | Complex config |
-| Free tier deploy | ✅ | ❌ |
+1. *SQL generation* at low temperature. The prompt contains the real schema and the join chain, and the model returns JSON with the SQL and its intent.
+2. *Answer formatting*. The model receives the question, the SQL and the first 25 result rows, and writes a short answer that cites specific values.
 
-The graph layer (in-memory Python dict) sits on top of SQLite for visualisation. SQL does the heavy querying; the graph provides exploration UX.
+**Three layers of guardrails.**
 
----
+1. A regex blocklist for clearly off-topic requests.
+2. An allowlist of about 50 domain keywords; a question must contain at least one.
+3. The model only sees real table definitions, so it cannot invent entities.
 
-## LLM Prompting Strategy
+## Running locally
 
-**Two-stage pipeline:**
-
-**Stage 1 — SQL Generation** (temp=0.05, deterministic):
-- System prompt includes full schema + the correct join chain
-- Instructed to output only `{"sql":"...", "intent":"..."}`
-- Strips markdown fences before JSON parsing
-
-**Stage 2 — Answer Formatting** (temp=0.1):
-- Receives question + SQL + top-25 result rows
-- Instructed to cite specific values, lead with the key finding, stay ≤5 sentences
-
----
-
-## Guardrails (3 layers)
-
-1. **Regex blocklist** — rejects: `write a poem`, `who is <person>`, `weather`, `joke`, `recipe`, `translate`
-2. **Domain keyword allowlist** — query must contain at least one of ~50 O2C domain words
-3. **Schema-scoped SQL** — LLM only sees real table definitions; cannot fabricate entities
-
-Response: `"This system answers questions about the SAP Order-to-Cash dataset only."`
-
----
-
-## Local Setup
+Backend:
 
 ```bash
-# Clone
-git clone <repo>
-cd dodge-ai-task
-
-# Backend
 cd backend
 pip install -r requirements.txt
-export GEMINI_API_KEY=your_key_here   # https://ai.google.dev
+export GROQ_API_KEY=your_key_here
 uvicorn main:app --reload --port 8000
-
-# Frontend (new terminal)
-cd frontend
-npm install
-npm run dev   # → http://localhost:5173
 ```
 
-Add data files to `backend/data/` — the system auto-detects entity types.
+Frontend, in a second terminal:
 
----
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-## Deploy to Render
+The app runs at http://localhost:5173. Data files go in `backend/data/`.
 
-1. Push to GitHub
-2. New Web Service → connect repo
-3. **Build:** `pip install -r backend/requirements.txt && cd frontend && npm install && npm run build`
-4. **Start:** `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. **Env var:** `GEMINI_API_KEY=your_key`
+## Deployment
 
----
+`render.yaml` defines a single Render web service that builds the frontend and serves it from the FastAPI app. Set `GROQ_API_KEY` in the Render dashboard.
 
-## Example Queries the System Handles
+## Example questions
 
-| Query | Type |
-|---|---|
-| "Which products appear in the most billing documents?" | Aggregation |
-| "Trace the full flow of billing document 90504219" | Multi-table join |
-| "Find sales orders delivered but never billed" | Gap analysis |
-| "Total invoice value per customer" | Group-by |
-| "Which plants handle the most deliveries?" | Cross-entity |
-| "Tell me everything about customer 320000083" | Entity deep-dive |
+| Question | Query type |
+| --- | --- |
+| Which products appear in the most billing documents? | Aggregation |
+| Trace the full flow of billing document 90504219 | Multi-table join |
+| Find sales orders delivered but never billed | Gap analysis |
+| Total invoice value per customer | Group by |
+| Which plants handle the most deliveries? | Cross-entity |
