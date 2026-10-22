@@ -1,14 +1,52 @@
 """
 llm.py — Groq-powered NL→SQL pipeline with guardrails.
-Uses llama-3.3-70b-versatile via Groq (fast, free, no rate limits)
+Uses llama-3.3-70b-versatile via Groq.
 """
 
-import os, json, re, sqlite3, httpx
+import os, json, re, sqlite3, time, httpx
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "o2c.db"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# ── Safe execution of LLM-generated SQL ───────────────────────────────────
+QUERY_TIMEOUT_SECONDS = 10
+
+# SQLite actions a read-only query is allowed to perform. Everything else
+# (INSERT, UPDATE, DELETE, DROP, ATTACH, PRAGMA, ...) is denied.
+_ALLOWED_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    getattr(sqlite3, "SQLITE_RECURSIVE", 33),  # WITH RECURSIVE
+}
+
+def _authorizer(action, *_):
+    return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
+
+def validate_sql(sql: str) -> str:
+    """Allow exactly one SELECT / WITH statement. Raises ValueError otherwise."""
+    cleaned = sql.strip().rstrip(";").strip()
+    if not re.match(r"(?is)^(select|with)\b", cleaned):
+        raise ValueError("Only SELECT queries are allowed.")
+    if ";" in cleaned:
+        raise ValueError("Only a single SQL statement is allowed.")
+    return cleaned
+
+def execute_readonly(sql: str, db_path=DB_PATH) -> list:
+    """Run a validated query on a read-only connection with a time limit."""
+    sql = validate_sql(sql)
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.set_authorizer(_authorizer)
+        deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
+        # Returning non-zero aborts the query, so runaway joins can't hang the server.
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
 
 DOMAIN_KEYWORDS = {
     "order","orders","sales","billing","invoice","invoices","delivery","deliveries",
@@ -124,10 +162,7 @@ def run_query(question: str, db_path=DB_PATH) -> dict:
 
     # Step 2: Execute SQL
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        rows = [dict(r) for r in conn.execute(sql).fetchall()]
-        conn.close()
+        rows = execute_readonly(sql, db_path)
     except Exception as e:
         return {"answer": f"Query error: {e}", "sql": sql,
                 "rows": [], "blocked": False, "error": str(e)}
